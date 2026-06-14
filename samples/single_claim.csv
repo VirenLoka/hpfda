@@ -1,2 +1,0 @@
-InscClaimAmtReimbursed,DeductibleAmtPaid,ClaimDurationDays,AdmitDurationDays,NumDiagnosisCodes,NumProcedureCodes,NumPhysicians,Age,NoOfMonths_PartACov,NoOfMonths_PartBCov,IPAnnualReimbursementAmt,IPAnnualDeductibleAmt,OPAnnualReimbursementAmt,OPAnnualDeductibleAmt,NumChronicConditions,Gender,Race,RenalDiseaseIndicator,State,IsInpatient,IsDead
-30000,1068,7,7,10,5,3,84,12,12,62000,4800,1800,420,8,1,1,Y,39,1,1

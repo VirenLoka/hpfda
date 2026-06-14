@@ -1,49 +1,19 @@
-"""Dataset + DataLoader construction for the aggregated fraud data."""
+"""Graph loading + label/loss helpers for transductive node classification.
+
+Training is full-batch over a single heterogeneous graph, so instead of
+mini-batch DataLoaders this module loads the saved graph, exposes the provider
+train/test masks, and provides the imbalance-aware loss + class weights.
+"""
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Dict, Tuple
+from typing import Tuple
 
-import numpy as np
-import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+import torch.nn as nn
+import torch.nn.functional as F
 
 from utils import resolve_path
-
-
-class FraudClaimsDataset(Dataset):
-    """Represents engineered claim features (numeric + categorical) and labels.
-
-    Numeric features are standardized using train statistics stored in the
-    feature-metadata file, so train and test share the same scaling.
-    """
-
-    def __init__(self, csv_path, metadata: dict):
-        self.numeric_cols = metadata["numeric"]
-        self.categorical_cols = metadata["categorical"]
-        self.label_col = metadata["label"]
-        norm = metadata["normalization"]
-
-        df = pd.read_csv(resolve_path(csv_path))
-
-        num = df[self.numeric_cols].astype(np.float32).copy()
-        for c in self.numeric_cols:
-            mean, std = norm[c]["mean"], norm[c]["std"] or 1.0
-            num[c] = (num[c] - mean) / std
-        self.x_num = torch.tensor(num.values, dtype=torch.float32)
-
-        self.x_cat = torch.tensor(
-            df[self.categorical_cols].astype(np.int64).values, dtype=torch.long
-        )
-        self.y = torch.tensor(df[self.label_col].astype(np.int64).values, dtype=torch.long)
-
-    def __len__(self) -> int:
-        return self.y.shape[0]
-
-    def __getitem__(self, idx: int):
-        return self.x_num[idx], self.x_cat[idx], self.y[idx]
 
 
 def load_metadata(path) -> dict:
@@ -51,30 +21,47 @@ def load_metadata(path) -> dict:
         return json.load(f)
 
 
-def build_dataloaders(cfg: dict) -> Tuple[DataLoader, DataLoader, dict]:
-    """Build train/test dataloaders + the feature metadata from config."""
+def load_graph(cfg: dict, device: torch.device) -> Tuple[object, dict]:
+    """Load the saved HeteroData graph and its metadata, moved onto ``device``."""
     metadata = load_metadata(cfg["data"]["metadata_json"])
-
-    train_ds = FraudClaimsDataset(cfg["data"]["train_csv"], metadata)
-    test_ds = FraudClaimsDataset(cfg["data"]["test_csv"], metadata)
-
-    bs = cfg["training"]["batch_size"]
-    workers = cfg["training"].get("num_workers", 0)
-
-    train_loader = DataLoader(
-        train_ds, batch_size=bs, shuffle=True, num_workers=workers, drop_last=False
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=bs, shuffle=False, num_workers=workers, drop_last=False
-    )
-    return train_loader, test_loader, metadata
+    # weights_only=False: the graph is our own trusted artifact (HeteroData).
+    data = torch.load(resolve_path(cfg["data"]["graph_path"]), weights_only=False)
+    data = data.to(device)
+    return data, metadata
 
 
-def compute_class_weights(cfg: dict, metadata: dict) -> torch.Tensor:
-    """Inverse-frequency class weights from the train CSV (for imbalance)."""
-    df = pd.read_csv(resolve_path(cfg["data"]["train_csv"]))
-    y = df[metadata["label"]].values
-    counts = np.bincount(y, minlength=cfg["model"]["n_classes"]).astype(np.float64)
-    counts[counts == 0] = 1.0
-    weights = counts.sum() / (len(counts) * counts)
-    return torch.tensor(weights, dtype=torch.float32)
+def compute_class_weights(data, n_classes: int) -> torch.Tensor:
+    """Inverse-frequency class weights from the provider *train* mask."""
+    y = data["provider"].y[data["provider"].train_mask]
+    counts = torch.bincount(y, minlength=n_classes).float()
+    counts = counts.clamp(min=1.0)
+    weights = counts.sum() / (n_classes * counts)
+    return weights
+
+
+class FocalLoss(nn.Module):
+    """Multi-class focal loss with optional per-class alpha weighting."""
+
+    def __init__(self, gamma: float = 2.0, alpha: torch.Tensor | None = None):
+        super().__init__()
+        self.gamma = gamma
+        self.register_buffer("alpha", alpha if alpha is not None else None)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logp = F.log_softmax(logits, dim=-1)
+        ce = F.nll_loss(logp, target, weight=self.alpha, reduction="none")
+        pt = logp.gather(1, target.unsqueeze(1)).squeeze(1).exp()
+        return ((1.0 - pt) ** self.gamma * ce).mean()
+
+
+def build_loss(cfg: dict, data, device: torch.device) -> nn.Module:
+    """Construct the configured loss (focal or weighted cross-entropy)."""
+    loss_cfg = cfg["loss"]
+    n_classes = cfg["model"]["n_classes"]
+    alpha = None
+    if loss_cfg.get("class_weights") == "auto":
+        alpha = compute_class_weights(data, n_classes).to(device)
+
+    if loss_cfg["type"] == "focal":
+        return FocalLoss(gamma=loss_cfg.get("focal_gamma", 2.0), alpha=alpha).to(device)
+    return nn.CrossEntropyLoss(weight=alpha)

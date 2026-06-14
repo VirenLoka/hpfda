@@ -1,12 +1,19 @@
 # =============================================================================
-# Healthcare Provider Fraud Detection - central configuration
-# Every script (aggregation, dataset, training) reads from this file.
+# Healthcare Provider Fraud Detection - Heterogeneous GNN configuration
+#
+# The pipeline builds ONE heterogeneous graph from the raw CSVs:
+#   node types : provider (labeled target), beneficiary, physician, claim
+#   edges      : beneficiary<->claim, claim<->provider, physician<->claim
+# Training is transductive node classification on provider nodes, with
+# train/test boolean masks over those nodes.
+#
+# Every script (graph build, training, inference) reads from this file.
 # =============================================================================
 
 seed: 42
 
 # -----------------------------------------------------------------------------
-# Data aggregation settings (used by src/aggregate_data.py)
+# Data / graph construction (src/aggregate_data.py)
 # -----------------------------------------------------------------------------
 data:
   raw_dir: healthcare_fraud_data
@@ -17,98 +24,82 @@ data:
     outpatient: Train_Outpatientdata-1542865627584.csv
 
   output_dir: data
-  train_csv: data/train.csv
-  test_csv: data/test.csv
-  metadata_json: data/feature_metadata.json
+  graph_path: data/graph.pt
+  metadata_json: data/graph_metadata.json
 
-  # Train/test split. The label is provider-level, so we split on the provider
-  # to avoid leaking a provider's claims across both partitions.
+  # A few held-out test providers are written here for inference demos.
+  sample_providers_csv: samples/sample_providers.csv
+  n_sample_providers: 10
+
+  # Provider-level train/test split (the labeled nodes), stratified by fraud.
   test_size: 0.2
-  split_by: Provider
   stratify: true
 
 # -----------------------------------------------------------------------------
-# Feature definition. The aggregation script engineers exactly these columns,
-# and the model sizes itself from them. Add/remove features here.
+# Feature engineering
 # -----------------------------------------------------------------------------
 features:
-  numeric:
-    - InscClaimAmtReimbursed
-    - DeductibleAmtPaid
-    - ClaimDurationDays
-    - AdmitDurationDays
-    - NumDiagnosisCodes
-    - NumProcedureCodes
-    - NumPhysicians
-    - Age
-    - NoOfMonths_PartACov
-    - NoOfMonths_PartBCov
-    - IPAnnualReimbursementAmt
-    - IPAnnualDeductibleAmt
-    - OPAnnualReimbursementAmt
-    - OPAnnualDeductibleAmt
-    - NumChronicConditions
-  categorical:
-    - Gender
-    - Race
-    - RenalDiseaseIndicator
-    - State
-    - IsInpatient
-    - IsDead
-  label: PotentialFraud
+  icd:
+    embedding_dim: 32        # dim of learned ICD diagnosis/procedure embeddings
+    max_diagnosis: 10        # ClmDiagnosisCode_1..10
+    max_procedure: 6         # ClmProcedureCode_1..6
+  # Beneficiary categorical columns that get their own learned embeddings.
+  beneficiary_categorical: [Gender, Race, State, RenalDiseaseIndicator]
+  cat_embedding_dim: 8
 
 # -----------------------------------------------------------------------------
-# Model architecture (FT-Transformer style feature tokenizer + encoder)
+# Heterogeneous GNN architecture
 # -----------------------------------------------------------------------------
-# Scaled for a ~500k-sample dataset (FT-Transformer style encoder).
 model:
-  d_model: 192
-  n_heads: 8
-  n_layers: 6
-  dim_feedforward: 512
-  dropout: 0.1
+  hidden_dim: 64
+  n_layers: 2              # message-passing rounds
+  dropout: 0.2
+  conv: sage              # per-relation operator (GraphSAGE)
   n_classes: 2
 
 # -----------------------------------------------------------------------------
-# Training loop
+# Loss (fraud is imbalanced)
+# -----------------------------------------------------------------------------
+loss:
+  type: focal             # focal | weighted_ce
+  focal_gamma: 2.0
+  class_weights: auto     # auto = inverse-frequency (alpha for focal / weight for CE), or null
+
+# -----------------------------------------------------------------------------
+# Training (full-batch transductive)
 # -----------------------------------------------------------------------------
 training:
-  batch_size: 512
-  epochs: 20
-  lr: 0.0003
-  weight_decay: 0.00001
-  num_workers: 0
-  eval_every: 1            # run the test-set evaluation every N epochs
-  device: auto             # auto | cpu | cuda | mps
-  class_weights: auto      # "auto" computes inverse-frequency weights, or null
+  epochs: 100
+  lr: 0.005
+  weight_decay: 0.0005
+  device: auto            # auto | cpu | cuda | mps
+  eval_every: 1           # evaluate on the test mask every N epochs
   grad_clip: 1.0
 
 # -----------------------------------------------------------------------------
 # Logging - all paths fully configurable
 # -----------------------------------------------------------------------------
 logging:
-  log_dir: runs/exp1
-  log_file: runs/exp1/train.log
+  log_dir: runs/gnn_exp1
+  log_file: runs/gnn_exp1/train.log
   tensorboard: true
-  log_every: 50            # log every N training steps
+  log_every: 10           # log every N epochs
 
 # -----------------------------------------------------------------------------
 # Checkpointing - all paths fully configurable
 # -----------------------------------------------------------------------------
 checkpoint:
-  dir: checkpoints/exp1
-  save_every: 1            # save a checkpoint every N epochs
-  keep_last: 3             # rolling window of recent checkpoints to keep
-  best_metric: f1          # metric monitored to keep best.pt (loss|acc|f1|auc)
-  best_mode: max           # max | min
+  dir: checkpoints/gnn_exp1
+  save_every: 5
+  keep_last: 3
+  best_metric: f1         # loss | acc | f1 | auc
+  best_mode: max
 
 # -----------------------------------------------------------------------------
-# Inference (src/inference.py). Defaults to the best checkpoint from training.
-# Sample inputs hold *raw* feature values; the script normalizes numerics and
-# encodes categoricals using the saved feature_metadata.json.
+# Inference: score provider nodes from a trained checkpoint.
+# Input is a CSV with a "Provider" column; the providers must exist in the graph.
 # -----------------------------------------------------------------------------
 inference:
-  checkpoint: checkpoints/exp1/best.pt
-  input_csv: samples/sample_claims.csv
-  output_csv: samples/predictions.csv
-  batch_size: 256
+  checkpoint: checkpoints/gnn_exp1/best.pt
+  input_csv: samples/sample_providers.csv
+  output_csv: samples/provider_predictions.csv

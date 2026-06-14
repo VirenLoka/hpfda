@@ -1,66 +1,28 @@
-"""Run fraud predictions from a trained checkpoint on a series of feature inputs.
+"""Score provider nodes for fraud from a trained HeteroGNN checkpoint.
 
-By default this loads the best checkpoint produced by training
-(``checkpoint.dir/best.pt`` via the ``inference.checkpoint`` config key) and
-scores an input CSV of *raw* feature values. Numeric features are standardized
-and categorical features are encoded using the saved ``feature_metadata.json``,
-exactly mirroring the training-time preprocessing.
+Because fraud is a property of a provider's whole neighborhood (its claims,
+patients and physicians), a provider cannot be scored from a flat feature row -
+it is scored in the context of the graph. This script therefore loads the saved
+graph + best checkpoint, runs one forward pass, and reports the fraud
+probability for the providers listed in an input CSV (a "Provider" column).
 
 Examples
 --------
-    # Use all defaults from configs/train_config.yaml
     python src/inference.py
-
-    # Point at a specific checkpoint and input file
-    python src/inference.py --checkpoint checkpoints/exp1/best.pt \
-        --input samples/sample_claims.csv --output samples/predictions.csv
+    python src/inference.py --checkpoint checkpoints/gnn_exp1/best.pt \
+        --input samples/sample_providers.csv --output samples/provider_predictions.csv
 """
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import torch
-from tqdm import tqdm
 
 from dataset import load_metadata
 from model import build_model
 from utils import get_logger, load_config, resolve_path, set_seed
-
-
-def preprocess(df: pd.DataFrame, metadata: dict):
-    """Turn a raw-feature DataFrame into (x_num, x_cat) tensors.
-
-    Numeric columns are standardized with the stored train mean/std; categorical
-    columns are mapped through the saved vocab (unknown/missing -> 0).
-    """
-    num_cols = metadata["numeric"]
-    cat_cols = metadata["categorical"]
-    norm = metadata["normalization"]
-    cat_meta = metadata["categorical_meta"]
-
-    missing = [c for c in num_cols + cat_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Input is missing required feature columns: {missing}")
-
-    num = df[num_cols].apply(pd.to_numeric, errors="coerce").astype(np.float32).copy()
-    for c in num_cols:
-        mean, std = norm[c]["mean"], norm[c]["std"] or 1.0
-        num[c] = (num[c].fillna(mean) - mean) / std
-    x_num = torch.tensor(num.values, dtype=torch.float32)
-
-    cat = np.zeros((len(df), len(cat_cols)), dtype=np.int64)
-    for j, c in enumerate(cat_cols):
-        vocab = cat_meta[c]["vocab"]
-        codes = (
-            df[c].astype("string").fillna("__nan__").map(lambda v: vocab.get(str(v), 0))
-        )
-        cat[:, j] = codes.fillna(0).astype(np.int64).values
-    x_cat = torch.tensor(cat, dtype=torch.long)
-    return x_num, x_cat
 
 
 def resolve_device() -> torch.device:
@@ -72,11 +34,11 @@ def resolve_device() -> torch.device:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Predict provider fraud from features.")
+    parser = argparse.ArgumentParser(description="Predict provider fraud with the GNN.")
     parser.add_argument("--config", default="configs/train_config.yaml")
-    parser.add_argument("--checkpoint", default=None, help="Override inference.checkpoint")
-    parser.add_argument("--input", default=None, help="Override inference.input_csv")
-    parser.add_argument("--output", default=None, help="Override inference.output_csv")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--input", default=None)
+    parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -87,61 +49,59 @@ def main():
     ckpt_path = resolve_path(args.checkpoint or infer_cfg["checkpoint"])
     input_path = resolve_path(args.input or infer_cfg["input_csv"])
     output_path = resolve_path(args.output or infer_cfg["output_csv"])
-    batch_size = infer_cfg.get("batch_size", 256)
 
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}. Train a model first (src/train.py)."
         )
 
-    metadata = load_metadata(cfg["data"]["metadata_json"])
     device = resolve_device()
+    metadata = load_metadata(cfg["data"]["metadata_json"])
+    data = torch.load(resolve_path(cfg["data"]["graph_path"]), weights_only=False).to(device)
+    edge_types = data.metadata()[1]
 
     logger.info("Loading checkpoint %s", ckpt_path)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    # Prefer the architecture the checkpoint was trained with, if present.
-    model_cfg = ckpt.get("config", cfg)
-    model = build_model(model_cfg, metadata).to(device)
+    model = build_model(ckpt.get("config", cfg), metadata, edge_types).to(device)
+    with torch.no_grad():
+        model(data)                 # lazy-init SAGEConv params before loading
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    logger.info(
-        "Checkpoint trained for %s epoch(s); metrics=%s",
-        ckpt.get("epoch", "?"), ckpt.get("metrics", {}),
-    )
+    logger.info("Checkpoint epoch=%s metrics=%s", ckpt.get("epoch", "?"), ckpt.get("metrics", {}))
+
+    with torch.no_grad():
+        logits = model(data)
+        probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+
+    prov_to_idx = {pid: i for i, pid in enumerate(metadata["provider_ids"])}
 
     df = pd.read_csv(input_path)
-    logger.info("Scoring %d rows from %s", len(df), input_path)
-    x_num, x_cat = preprocess(df, metadata)
+    if "Provider" not in df.columns:
+        raise ValueError("Input CSV must contain a 'Provider' column.")
 
-    probs: List[float] = []
-    with torch.no_grad():
-        for i in tqdm(range(0, len(df), batch_size), desc="Predicting", unit="batch"):
-            xn = x_num[i : i + batch_size].to(device)
-            xc = x_cat[i : i + batch_size].to(device)
-            logits = model(xn, xc)
-            p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            probs.extend(p.tolist())
-
-    fraud_prob = np.asarray(probs)
-    pred = (fraud_prob >= 0.5).astype(int)
-    result = df.copy()
-    result["FraudProbability"] = np.round(fraud_prob, 4)
-    result["PredictedFraud"] = np.where(pred == 1, "Yes", "No")
+    rows = []
+    unknown = 0
+    for pid in df["Provider"].astype(str):
+        idx = prov_to_idx.get(pid)
+        if idx is None:
+            unknown += 1
+            rows.append({"Provider": pid, "FraudProbability": np.nan, "PredictedFraud": "UNKNOWN"})
+        else:
+            p = float(probs[idx])
+            rows.append({"Provider": pid, "FraudProbability": round(p, 4),
+                         "PredictedFraud": "Yes" if p >= 0.5 else "No"})
+    result = pd.DataFrame(rows)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_path, index=False)
     logger.info("Wrote predictions to %s", output_path)
+    if unknown:
+        logger.warning("%d provider(s) were not in the graph and got UNKNOWN.", unknown)
 
-    # Console preview
-    preview_cols = ["FraudProbability", "PredictedFraud"]
-    logger.info(
-        "\n%s",
-        result[preview_cols].to_string(max_rows=20),
-    )
-    logger.info(
-        "Predicted fraud: %d / %d (%.1f%%)",
-        int(pred.sum()), len(pred), 100.0 * pred.mean(),
-    )
+    logger.info("\n%s", result.to_string(max_rows=30, index=False))
+    flagged = (result["PredictedFraud"] == "Yes").sum()
+    scored = (result["PredictedFraud"] != "UNKNOWN").sum()
+    logger.info("Flagged fraud: %d / %d scored", int(flagged), int(scored))
 
 
 if __name__ == "__main__":
