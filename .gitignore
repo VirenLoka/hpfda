@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Generated data artifacts
+data/
+*.csv.gz
+
+# Training outputs
+runs/
+checkpoints/
+*.pt
+*.pth
+
+# Logs
+*.log
+logs/
+
+# Notebooks / archives (large raw inputs are kept out of git)
+.ipynb_checkpoints/
+*.zip
+
+# Raw dataset (large; do not commit)
+healthcare_fraud_data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

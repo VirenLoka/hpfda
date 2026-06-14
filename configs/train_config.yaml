@@ -1,0 +1,102 @@
+# =============================================================================
+# Healthcare Provider Fraud Detection - central configuration
+# Every script (aggregation, dataset, training) reads from this file.
+# =============================================================================
+
+seed: 42
+
+# -----------------------------------------------------------------------------
+# Data aggregation settings (used by src/aggregate_data.py)
+# -----------------------------------------------------------------------------
+data:
+  raw_dir: healthcare_fraud_data
+  files:
+    train_labels: Train-1542865627584.csv
+    beneficiary: Train_Beneficiarydata-1542865627584.csv
+    inpatient: Train_Inpatientdata-1542865627584.csv
+    outpatient: Train_Outpatientdata-1542865627584.csv
+
+  output_dir: data
+  train_csv: data/train.csv
+  test_csv: data/test.csv
+  metadata_json: data/feature_metadata.json
+
+  # Train/test split. The label is provider-level, so we split on the provider
+  # to avoid leaking a provider's claims across both partitions.
+  test_size: 0.2
+  split_by: Provider
+  stratify: true
+
+# -----------------------------------------------------------------------------
+# Feature definition. The aggregation script engineers exactly these columns,
+# and the model sizes itself from them. Add/remove features here.
+# -----------------------------------------------------------------------------
+features:
+  numeric:
+    - InscClaimAmtReimbursed
+    - DeductibleAmtPaid
+    - ClaimDurationDays
+    - AdmitDurationDays
+    - NumDiagnosisCodes
+    - NumProcedureCodes
+    - NumPhysicians
+    - Age
+    - NoOfMonths_PartACov
+    - NoOfMonths_PartBCov
+    - IPAnnualReimbursementAmt
+    - IPAnnualDeductibleAmt
+    - OPAnnualReimbursementAmt
+    - OPAnnualDeductibleAmt
+    - NumChronicConditions
+  categorical:
+    - Gender
+    - Race
+    - RenalDiseaseIndicator
+    - State
+    - IsInpatient
+    - IsDead
+  label: PotentialFraud
+
+# -----------------------------------------------------------------------------
+# Model architecture (FT-Transformer style feature tokenizer + encoder)
+# -----------------------------------------------------------------------------
+model:
+  d_model: 64
+  n_heads: 8
+  n_layers: 3
+  dim_feedforward: 128
+  dropout: 0.1
+  n_classes: 2
+
+# -----------------------------------------------------------------------------
+# Training loop
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 512
+  epochs: 20
+  lr: 0.0003
+  weight_decay: 0.00001
+  num_workers: 0
+  eval_every: 1            # run the test-set evaluation every N epochs
+  device: auto             # auto | cpu | cuda | mps
+  class_weights: auto      # "auto" computes inverse-frequency weights, or null
+  grad_clip: 1.0
+
+# -----------------------------------------------------------------------------
+# Logging - all paths fully configurable
+# -----------------------------------------------------------------------------
+logging:
+  log_dir: runs/exp1
+  log_file: runs/exp1/train.log
+  tensorboard: true
+  log_every: 50            # log every N training steps
+
+# -----------------------------------------------------------------------------
+# Checkpointing - all paths fully configurable
+# -----------------------------------------------------------------------------
+checkpoint:
+  dir: checkpoints/exp1
+  save_every: 1            # save a checkpoint every N epochs
+  keep_last: 3             # rolling window of recent checkpoints to keep
+  best_metric: f1          # metric monitored to keep best.pt (loss|acc|f1|auc)
+  best_mode: max           # max | min
