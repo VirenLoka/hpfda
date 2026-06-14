@@ -16,6 +16,10 @@ ENV/
 data/
 *.csv.gz
 
+# Inference outputs (keep sample inputs, ignore generated predictions)
+samples/predictions.csv
+samples/*_prediction*.csv
+
 # Training outputs
 runs/
 checkpoints/

@@ -60,11 +60,12 @@ features:
 # -----------------------------------------------------------------------------
 # Model architecture (FT-Transformer style feature tokenizer + encoder)
 # -----------------------------------------------------------------------------
+# Scaled for a ~500k-sample dataset (FT-Transformer style encoder).
 model:
-  d_model: 64
+  d_model: 192
   n_heads: 8
-  n_layers: 3
-  dim_feedforward: 128
+  n_layers: 6
+  dim_feedforward: 512
   dropout: 0.1
   n_classes: 2
 
@@ -100,3 +101,14 @@ checkpoint:
   keep_last: 3             # rolling window of recent checkpoints to keep
   best_metric: f1          # metric monitored to keep best.pt (loss|acc|f1|auc)
   best_mode: max           # max | min
+
+# -----------------------------------------------------------------------------
+# Inference (src/inference.py). Defaults to the best checkpoint from training.
+# Sample inputs hold *raw* feature values; the script normalizes numerics and
+# encodes categoricals using the saved feature_metadata.json.
+# -----------------------------------------------------------------------------
+inference:
+  checkpoint: checkpoints/exp1/best.pt
+  input_csv: samples/sample_claims.csv
+  output_csv: samples/predictions.csv
+  batch_size: 256

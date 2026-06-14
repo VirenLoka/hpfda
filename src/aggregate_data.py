@@ -24,6 +24,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from tqdm import tqdm
 
 from utils import get_logger, load_config, resolve_path, set_seed
 
@@ -64,10 +65,17 @@ def build_claims(cfg: dict, logger) -> pd.DataFrame:
     files = cfg["data"]["files"]
 
     logger.info("Reading raw CSVs from %s", raw_dir)
-    inp = _read_csv(raw_dir / files["inpatient"])
-    out = _read_csv(raw_dir / files["outpatient"])
-    bene = _read_csv(raw_dir / files["beneficiary"])
-    labels = _read_csv(raw_dir / files["train_labels"])
+    read_targets = {
+        "inpatient": files["inpatient"],
+        "outpatient": files["outpatient"],
+        "beneficiary": files["beneficiary"],
+        "train_labels": files["train_labels"],
+    }
+    frames = {}
+    for key, fname in tqdm(read_targets.items(), desc="Reading CSVs", unit="file"):
+        frames[key] = _read_csv(raw_dir / fname)
+    inp, out = frames["inpatient"], frames["outpatient"]
+    bene, labels = frames["beneficiary"], frames["train_labels"]
     logger.info(
         "inpatient=%d outpatient=%d beneficiaries=%d providers=%d",
         len(inp), len(out), len(bene), len(labels),
@@ -84,10 +92,12 @@ def build_claims(cfg: dict, logger) -> pd.DataFrame:
     logger.info("Combined claims: %d", len(claims))
 
     # ---- join beneficiary + provider label --------------------------------
+    pbar = tqdm(total=6, desc="Engineering features", unit="step")
     claims = claims.merge(bene, on="BeneID", how="left")
     claims = claims.merge(labels, on="Provider", how="left")
     claims = claims[claims["PotentialFraud"].notna()].copy()
     logger.info("Claims with a provider label: %d", len(claims))
+    pbar.update(1)  # joins
 
     # ---- engineered features ---------------------------------------------
     feat = pd.DataFrame(index=claims.index)
@@ -96,6 +106,7 @@ def build_claims(cfg: dict, logger) -> pd.DataFrame:
     # Monetary
     feat["InscClaimAmtReimbursed"] = _to_num(claims["InscClaimAmtReimbursed"]).fillna(0.0)
     feat["DeductibleAmtPaid"] = _to_num(claims["DeductibleAmtPaid"]).fillna(0.0)
+    pbar.update(1)  # monetary
 
     # Durations (days)
     start = _to_date(claims["ClaimStartDt"])
@@ -104,11 +115,13 @@ def build_claims(cfg: dict, logger) -> pd.DataFrame:
     adm = _to_date(claims["AdmissionDt"])
     dis = _to_date(claims["DischargeDt"])
     feat["AdmitDurationDays"] = (dis - adm).dt.days.fillna(0).clip(lower=0)
+    pbar.update(1)  # durations
 
     # Counts
     feat["NumDiagnosisCodes"] = claims[DIAG_COLS].notna().sum(axis=1)
     feat["NumProcedureCodes"] = claims[PROC_COLS].notna().sum(axis=1)
     feat["NumPhysicians"] = claims[PHYS_COLS].notna().sum(axis=1)
+    pbar.update(1)  # counts
 
     # Patient age at claim start; death flag
     dob = _to_date(claims["DOB"])
@@ -131,6 +144,7 @@ def build_claims(cfg: dict, logger) -> pd.DataFrame:
     # Chronic conditions are encoded 1=yes, 2=no -> count the "yes"es.
     chronic = claims[CHRONIC_COLS].apply(_to_num)
     feat["NumChronicConditions"] = (chronic == 1).sum(axis=1)
+    pbar.update(1)  # patient/coverage/chronic
 
     # Categorical (kept raw here; encoded to integer codes below)
     feat["Gender"] = claims["Gender"]
@@ -141,6 +155,8 @@ def build_claims(cfg: dict, logger) -> pd.DataFrame:
     # IsDead already set above.
 
     feat["PotentialFraud"] = (claims["PotentialFraud"] == "Yes").astype(int)
+    pbar.update(1)  # categoricals + label
+    pbar.close()
     return feat
 
 
@@ -172,7 +188,7 @@ def encode_categoricals(train_df, test_df, cat_cols: List[str]) -> Dict[str, dic
     Returns {col: {"vocab": {value: code}, "cardinality": N}}.
     """
     meta: Dict[str, dict] = {}
-    for col in cat_cols:
+    for col in tqdm(cat_cols, desc="Encoding categoricals", unit="col"):
         values = train_df[col].astype("string").fillna("__nan__").unique().tolist()
         vocab = {str(v): i + 1 for i, v in enumerate(sorted(values))}  # 0 = unknown
         for frame in (train_df, test_df):
@@ -233,10 +249,21 @@ def main():
     logger.info("Wrote %s (%d rows)", train_path, len(train_df))
     logger.info("Wrote %s (%d rows)", test_path, len(test_df))
     logger.info("Wrote %s", meta_path)
-    logger.info(
-        "Fraud rate: train=%.3f test=%.3f",
-        metadata["train_fraud_rate"], metadata["test_fraud_rate"],
-    )
+
+    total = len(train_df) + len(test_df)
+    summary = [
+        "",
+        "==================== Aggregation summary ====================",
+        f"  Total claims         : {total:,}",
+        f"  Train / Test claims  : {len(train_df):,} / {len(test_df):,}",
+        f"  Numeric features     : {len(num_cols)}",
+        f"  Categorical features : {len(cat_cols)}  "
+        f"(cardinalities: {[cat_meta[c]['cardinality'] for c in cat_cols]})",
+        f"  Fraud rate train/test: {metadata['train_fraud_rate']:.3f} / "
+        f"{metadata['test_fraud_rate']:.3f}",
+        "=============================================================",
+    ]
+    logger.info("\n".join(summary))
 
 
 if __name__ == "__main__":

@@ -14,10 +14,30 @@ from typing import Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from dataset import build_dataloaders, compute_class_weights
 from model import build_model
 from utils import get_logger, load_config, resolve_path, set_seed
+
+
+def model_stats(model: nn.Module) -> Dict[str, float]:
+    """Parameter counts and an estimate of the model footprint in MB."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    buf_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+    return {
+        "total": total,
+        "trainable": trainable,
+        "size_mb": (param_bytes + buf_bytes) / (1024 ** 2),
+    }
+
+
+def grad_global_norm(model: nn.Module, grad_clip: float | None) -> float:
+    """Return the global L2 grad norm (clipping in place if grad_clip is set)."""
+    max_norm = grad_clip if grad_clip else float("inf")
+    return float(nn.utils.clip_grad_norm_(model.parameters(), max_norm))
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -35,7 +55,7 @@ def evaluate(model, loader, device, criterion) -> Dict[str, float]:
     model.eval()
     total_loss, n = 0.0, 0
     all_logits, all_labels = [], []
-    for x_num, x_cat, y in loader:
+    for x_num, x_cat, y in tqdm(loader, desc="  eval", unit="batch", leave=False):
         x_num, x_cat, y = x_num.to(device), x_cat.to(device), y.to(device)
         logits = model(x_num, x_cat)
         loss = criterion(logits, y)
@@ -138,8 +158,28 @@ def main():
     )
 
     model = build_model(cfg, metadata).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    logger.info("Model parameters: %d", n_params)
+    stats = model_stats(model)
+    n_features = len(metadata["numeric"]) + len(metadata["categorical"])
+    logger.info(
+        "\n".join([
+            "",
+            "==================== Model / data summary ===================",
+            f"  Device               : {device}",
+            f"  Architecture         : FT-Transformer (d_model={cfg['model']['d_model']}, "
+            f"layers={cfg['model']['n_layers']}, heads={cfg['model']['n_heads']}, "
+            f"ff={cfg['model']['dim_feedforward']})",
+            f"  Parameters           : {stats['total']:,} total / "
+            f"{stats['trainable']:,} trainable  (~{stats['size_mb']:.1f} MB)",
+            f"  Input tokens/sample  : {n_features} features + 1 [CLS]",
+            f"  Train samples        : {metadata['n_train']:,}  "
+            f"({len(train_loader)} batches/epoch)",
+            f"  Test samples         : {metadata['n_test']:,}  "
+            f"({len(test_loader)} batches)",
+            f"  Batch size / epochs  : {cfg['training']['batch_size']} / "
+            f"{cfg['training']['epochs']}",
+            "=============================================================",
+        ])
+    )
 
     # class weights for imbalance
     weight = None
@@ -175,32 +215,46 @@ def main():
     for epoch in range(1, epochs + 1):
         model.train()
         running, seen = 0.0, 0
-        for step, (x_num, x_cat, y) in enumerate(train_loader, 1):
+        grad_norms: List[float] = []
+        pbar = tqdm(
+            train_loader, desc=f"Epoch {epoch}/{epochs}", unit="batch", leave=False
+        )
+        for step, (x_num, x_cat, y) in enumerate(pbar, 1):
             x_num, x_cat, y = x_num.to(device), x_cat.to(device), y.to(device)
             optimizer.zero_grad()
             logits = model(x_num, x_cat)
             loss = criterion(logits, y)
             loss.backward()
-            if grad_clip:
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            gnorm = grad_global_norm(model, grad_clip)  # measures (and clips) grads
             optimizer.step()
 
+            grad_norms.append(gnorm)
             running += loss.item() * y.size(0)
             seen += y.size(0)
             global_step += 1
+
+            pbar.set_postfix(loss=f"{running / seen:.4f}", grad=f"{gnorm:.2f}")
             if step % log_every == 0:
                 avg = running / seen
                 logger.info(
-                    "epoch %d | step %d/%d | loss %.4f",
-                    epoch, step, len(train_loader), avg,
+                    "epoch %d | step %d/%d | loss %.4f | grad_norm %.3f",
+                    epoch, step, len(train_loader), avg, gnorm,
                 )
                 if writer:
                     writer.add_scalar("train/loss_step", loss.item(), global_step)
+                    writer.add_scalar("train/grad_norm", gnorm, global_step)
+        pbar.close()
 
         train_loss = running / max(seen, 1)
-        logger.info("epoch %d done | train_loss %.4f", epoch, train_loss)
+        g = np.asarray(grad_norms, dtype=np.float64)
+        logger.info(
+            "epoch %d done | train_loss %.4f | grad_norm mean=%.3f max=%.3f min=%.3f",
+            epoch, train_loss, g.mean(), g.max(), g.min(),
+        )
         if writer:
             writer.add_scalar("train/loss_epoch", train_loss, epoch)
+            writer.add_scalar("train/grad_norm_mean", g.mean(), epoch)
+            writer.add_scalar("train/grad_norm_max", g.max(), epoch)
 
         metrics = {"loss": train_loss}
         if epoch % eval_every == 0:

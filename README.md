@@ -18,6 +18,9 @@ src/model.py                       (FT-Transformer: per-feature tokens + [CLS] +
         │  src/train.py            (training loop, periodic test eval, logging, checkpointing)
         ▼
 runs/<exp>/  (logs + TensorBoard)   checkpoints/<exp>/  (rolling + best.pt)
+        │  src/inference.py        (load best.pt, score raw feature inputs)
+        ▼
+samples/predictions.csv
 ```
 
 The fraud label (`PotentialFraud`) is provider-level, so the train/test split is
@@ -43,7 +46,26 @@ python src/train.py --config configs/train_config.yaml
 
 # 3. (optional) Inspect training curves
 tensorboard --logdir runs/
+
+# 4. Predict on new claims (defaults to checkpoints/exp1/best.pt + samples/sample_claims.csv)
+python src/inference.py
+python src/inference.py --checkpoint checkpoints/exp1/best.pt \
+    --input samples/single_claim.csv --output samples/single_prediction.csv
 ```
+
+The aggregation and training scripts show `tqdm` progress bars and print
+summary blocks (dataset size, feature counts, model parameter count / footprint,
+per-epoch gradient-norm statistics).
+
+## Inference inputs
+
+`src/inference.py` loads the best checkpoint and scores a CSV of **raw** feature
+values (the 15 numeric + 6 categorical feature columns — no label needed). It
+applies the exact training-time preprocessing (numeric standardization +
+categorical vocab encoding from `feature_metadata.json`) and writes a copy of the
+input with `FraudProbability` and `PredictedFraud` columns appended. Two ready
+samples are provided: [`samples/sample_claims.csv`](samples/sample_claims.csv)
+(8 rows) and [`samples/single_claim.csv`](samples/single_claim.csv) (1 row).
 
 ## Configuration
 
